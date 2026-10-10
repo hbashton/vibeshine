@@ -2940,6 +2940,7 @@ namespace confighttp {
       static const std::set<std::string> restart_required_keys = {
         "port",
         "address_family",
+        "ds4windows_bridge",
         "upnp",
         "pkey",
         "cert"
@@ -3049,6 +3050,7 @@ namespace confighttp {
       static const std::set<std::string> restart_required_keys = {
         "port",
         "address_family",
+        "ds4windows_bridge",
         "upnp",
         "pkey",
         "cert"

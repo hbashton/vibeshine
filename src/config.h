@@ -296,6 +296,8 @@ namespace config {
     std::chrono::duration<double> key_repeat_period;
 
     std::string gamepad;
+    // Send normalized Moonlight controller data to the DS4Windows local bridge.
+    bool ds4windows_bridge;
     bool ds4_back_as_touchpad_click;
     bool motion_as_ds4;
     bool touchpad_as_ds4;

@@ -718,6 +718,8 @@
     "file_state_desc": "The file where current state of Vibeshine is stored",
     "gamepad": "Emulated Gamepad Type",
     "gamepad_auto": "Automatic selection options",
+    "ds4windows_bridge": "Send controller input directly to DS4Windows",
+    "ds4windows_bridge_desc": "Let DS4Windows create the game-facing virtual controller. This bypasses Sunshine's virtual controller and sends Moonlight controls, motion, touch, and battery data over a local pipe. Enable the matching option in DS4Windows too.",
     "gamepad_desc": "Choose which type of gamepad to emulate on the host. The Vibeshine Virtual Gamepad options use Vibeshine's own driver instead of ViGEmBus. Automatic presents a DualSense to PlayStation clients and an Xbox Series controller otherwise. Xbox Series and Xbox One are the options Windows places on the XInput path, so they are the ones games that support only XInput can see. DualShock 4 and DualSense add the touchpad, motion, battery, lightbar, and (DualSense) adaptive triggers. DualSense with waveform haptics presents a wired USB DualSense and its controller audio endpoint to Windows games, regardless of the physical client connection. It requires the optional DualSense USB audio and haptics installer component and a Moonlight client with waveform support.",
     "gamepad_desc_linux": "Choose which virtual controller Linux exposes through UHID. Automatic follows the controller type reported by the client; select DS4 to force a DualShock 4 with rumble, touchpad, motion, battery, and lightbar support.",
     "gamepad_ds4": "DS4 (PS4)",

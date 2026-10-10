@@ -442,8 +442,13 @@ namespace input {
 
   void print(void *payload) {
     auto header = (PNV_INPUT_HEADER) payload;
+    const auto magic = util::endian::little(header->magic);
+    const auto packet_size = static_cast<std::size_t>(util::endian::big(header->size)) + sizeof(header->size);
+    if (validation::is_haptics_packet(magic, packet_size)) {
+      return;
+    }
 
-    switch (util::endian::little(header->magic)) {
+    switch (magic) {
       case MOUSE_MOVE_REL_MAGIC_GEN5:
         print((PNV_REL_MOUSE_MOVE_PACKET) payload);
         break;
@@ -467,6 +472,7 @@ namespace input {
       case UTF8_TEXT_EVENT_MAGIC:
         print((PNV_UNICODE_PACKET) payload);
         break;
+      case MULTI_CONTROLLER_MAGIC:
       case MULTI_CONTROLLER_MAGIC_GEN5:
         print((PNV_MULTI_CONTROLLER_PACKET) payload);
         break;
@@ -1606,12 +1612,18 @@ namespace input {
    */
   batch_result_e batch(PNV_INPUT_HEADER dest, PNV_INPUT_HEADER src) {
     // We can only batch if the packet types are the same
-    if (dest->magic != src->magic) {
+    if (dest->magic != src->magic || dest->size != src->size) {
+      return batch_result_e::terminate_batch;
+    }
+
+    const auto magic = util::endian::little(dest->magic);
+    const auto packet_size = static_cast<std::size_t>(util::endian::big(dest->size)) + sizeof(dest->size);
+    if (validation::is_haptics_packet(magic, packet_size)) {
       return batch_result_e::terminate_batch;
     }
 
     // We can only batch certain message types
-    switch (util::endian::little(dest->magic)) {
+    switch (magic) {
       case MOUSE_MOVE_REL_MAGIC_GEN5:
         return batch((PNV_REL_MOUSE_MOVE_PACKET) dest, (PNV_REL_MOUSE_MOVE_PACKET) src);
       case MOUSE_MOVE_ABS_MAGIC:
@@ -1620,6 +1632,7 @@ namespace input {
         return batch((PNV_SCROLL_PACKET) dest, (PNV_SCROLL_PACKET) src);
       case SS_HSCROLL_MAGIC:
         return batch((PSS_HSCROLL_PACKET) dest, (PSS_HSCROLL_PACKET) src);
+      case MULTI_CONTROLLER_MAGIC:
       case MULTI_CONTROLLER_MAGIC_GEN5:
         return batch((PNV_MULTI_CONTROLLER_PACKET) dest, (PNV_MULTI_CONTROLLER_PACKET) src);
       case SS_TOUCH_MAGIC:
@@ -1686,7 +1699,9 @@ namespace input {
     input::print((void *) payload);
 
     // Send the batched input to the OS
-    switch (util::endian::little(payload->magic)) {
+    const auto magic = util::endian::little(payload->magic);
+    const auto packet_size = static_cast<std::size_t>(util::endian::big(payload->size)) + sizeof(payload->size);
+    switch (magic) {
       case MOUSE_MOVE_REL_MAGIC_GEN5:
         passthrough(input, (PNV_REL_MOUSE_MOVE_PACKET) payload);
         break;
@@ -1709,6 +1724,11 @@ namespace input {
         break;
       case UTF8_TEXT_EVENT_MAGIC:
         passthrough((PNV_UNICODE_PACKET) payload);
+        break;
+      case MULTI_CONTROLLER_MAGIC:
+        if (!validation::is_haptics_packet(magic, packet_size)) {
+          passthrough(input, (PNV_MULTI_CONTROLLER_PACKET) payload);
+        }
         break;
       case MULTI_CONTROLLER_MAGIC_GEN5:
         passthrough(input, (PNV_MULTI_CONTROLLER_PACKET) payload);

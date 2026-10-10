@@ -866,6 +866,12 @@ export const settingsCategories: SettingsCategory[] = [
           boolean('mouse'),
           boolean('controller'),
           select('gamepad', gamepadOptions, { platform: ['windows', 'linux'] }),
+          boolean('ds4windows_bridge', {
+            platform: 'windows',
+            restartRequired: true,
+            labelKey: 'config.ds4windows_bridge',
+            descriptionKey: 'config.ds4windows_bridge_desc',
+          }),
           boolean('proton_dualsense_compatibility', { platform: 'linux' }),
           boolean('motion_as_ds4'),
           boolean('touchpad_as_ds4'),
@@ -1103,6 +1109,7 @@ export const settingsCategories: SettingsCategory[] = [
 export const settingsDefaults: Record<string, unknown> = {
   ...extendedDefaults,
   gamepad: 'auto',
+  ds4windows_bridge: false,
   virtual_display_mode: 'per_client',
   virtual_display_layout: 'exclusive',
   virtual_display_max_clients: 4,
@@ -1214,7 +1221,14 @@ export const knownSettingsKeys = new Set(
 );
 knownSettingsKeys.add('adapter_pnp_id');
 
-export const restartRequiredKeys = new Set(['address_family', 'cert', 'pkey', 'port', 'upnp']);
+export const restartRequiredKeys = new Set([
+  'address_family',
+  'cert',
+  'ds4windows_bridge',
+  'pkey',
+  'port',
+  'upnp',
+]);
 
 export function matchesPlatform(
   field: { platform?: SettingsField['platform'] },

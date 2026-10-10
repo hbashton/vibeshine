@@ -1013,6 +1013,7 @@ namespace config {
       platf::supported_gamepads(nullptr).front().name.size(),
 #endif
     },  // Default gamepad
+    false,  // DS4Windows controller bridge is opt-in
     true,  // back as touchpad click enabled (manual DS4 only)
     true,  // client gamepads with motion events are emulated as DS4
     true,  // client gamepads with touchpads are emulated as DS4
@@ -2116,6 +2117,7 @@ namespace config {
     }
 
     string_restricted_f(vars, "gamepad"s, input.gamepad, get_supported_gamepad_options());
+    bool_f(vars, "ds4windows_bridge", input.ds4windows_bridge);
     bool_f(vars, "ds4_back_as_touchpad_click", input.ds4_back_as_touchpad_click);
     bool_f(vars, "motion_as_ds4", input.motion_as_ds4);
     bool_f(vars, "proton_dualsense_compatibility", input.proton_dualsense_compatibility);

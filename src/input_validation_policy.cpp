@@ -4,11 +4,17 @@
  */
 #include "input_validation_policy.h"
 
+#include <algorithm>
+
 extern "C" {
 #include <moonlight-common-c/src/Input.h>
 }
 
 namespace input::validation {
+  bool is_haptics_packet(const std::uint32_t magic, const std::size_t total_size) {
+    return magic == ENABLE_HAPTICS_MAGIC && total_size == sizeof(NV_HAPTICS_PACKET);
+  }
+
   namespace {
     std::optional<std::uint32_t> read_u32_be(const std::vector<std::uint8_t> &input_data, const std::size_t offset) {
       if (offset > input_data.size() || input_data.size() - offset < sizeof(std::uint32_t)) {
@@ -50,6 +56,12 @@ namespace input::validation {
           return packet_size_bounds_t {sizeof(NV_KEYBOARD_PACKET), sizeof(NV_KEYBOARD_PACKET)};
         case UTF8_TEXT_EVENT_MAGIC:
           return packet_size_bounds_t {sizeof(NV_INPUT_HEADER), sizeof(NV_UNICODE_PACKET)};
+        case MULTI_CONTROLLER_MAGIC:
+          // Legacy controller reports and the haptics-enable packet share this magic.
+          return packet_size_bounds_t {
+            std::min(sizeof(NV_HAPTICS_PACKET), sizeof(NV_MULTI_CONTROLLER_PACKET)),
+            std::max(sizeof(NV_HAPTICS_PACKET), sizeof(NV_MULTI_CONTROLLER_PACKET))
+          };
         case MULTI_CONTROLLER_MAGIC_GEN5:
           return packet_size_bounds_t {sizeof(NV_MULTI_CONTROLLER_PACKET), sizeof(NV_MULTI_CONTROLLER_PACKET)};
         case SS_TOUCH_MAGIC:
@@ -96,6 +108,16 @@ namespace input::validation {
     }
 
     if (total_size < bounds->min_total_size || total_size > bounds->max_total_size) {
+      return {
+        .error = packet_validation_error_e::invalid_size,
+        .magic = *magic,
+        .total_size = total_size,
+        .expected_size = *bounds,
+      };
+    }
+
+    if (*magic == MULTI_CONTROLLER_MAGIC && total_size != sizeof(NV_HAPTICS_PACKET) &&
+        total_size != sizeof(NV_MULTI_CONTROLLER_PACKET)) {
       return {
         .error = packet_validation_error_e::invalid_size,
         .magic = *magic,

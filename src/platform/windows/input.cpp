@@ -9,8 +9,18 @@
 #include <Windows.h>
 
 // standard includes
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -88,6 +98,693 @@ namespace platf {
 
     gamepad_feedback_msg_t last_rumble;
     gamepad_feedback_msg_t last_rgb_led;
+  };
+
+  /**
+   * Local app-to-app transport used when DS4Windows owns the game-facing
+   * virtual controller. Records are fixed-size so the input path performs no
+   * serialization allocations. The stream still contains Moonlight's
+   * normalized controls and sensor samples, not original HID report bytes.
+   */
+  class sunshine_controller_bridge_t {
+  public:
+    static constexpr std::size_t RECORD_LENGTH = 64;
+    static constexpr std::uint16_t VERSION = 1;
+    static constexpr char PIPE_NAME[] = R"(\\.\pipe\Vibeshine.ControllerBridge.v1)";
+    static constexpr auto MOTION_RE_REQUEST_AFTER = std::chrono::seconds(2);
+    static constexpr auto MOTION_RE_REQUEST_COOLDOWN = std::chrono::seconds(5);
+
+    enum class packet_kind_e : std::uint8_t {
+      hello = 1,
+      hello_accepted = 2,
+      arrival = 3,
+      state = 4,
+      motion = 5,
+      touch = 6,
+      battery = 7,
+      remove = 8,
+      feedback = 9,
+    };
+
+    enum class feedback_kind_e : std::uint8_t {
+      rumble = 1,
+      rumble_triggers = 2,
+      motion_event_state = 3,
+      rgb_led = 4,
+      adaptive_triggers = 5,
+    };
+
+    sunshine_controller_bridge_t():
+        session_id {make_session_id()} {
+      stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      if (!stop_event) {
+        throw std::runtime_error("Could not create the DS4Windows bridge stop event");
+      }
+      try {
+        worker = std::thread {[this]() { run(); }};
+        writer = std::thread {[this]() { write_loop(); }};
+      } catch (...) {
+        stopping.store(true, std::memory_order_release);
+        SetEvent(stop_event);
+        outgoing_cv.notify_all();
+        if (worker.joinable()) worker.join();
+        if (writer.joinable()) writer.join();
+        CloseHandle(stop_event);
+        stop_event = nullptr;
+        throw;
+      }
+    }
+
+    ~sunshine_controller_bridge_t() {
+      stopping.store(true, std::memory_order_release);
+      if (stop_event) SetEvent(stop_event);
+      outgoing_cv.notify_all();
+      if (worker.joinable()) {
+        CancelSynchronousIo(reinterpret_cast<HANDLE>(
+            static_cast<std::uintptr_t>(worker.native_handle())));
+      }
+      if (writer.joinable()) {
+        CancelSynchronousIo(reinterpret_cast<HANDLE>(
+            static_cast<std::uintptr_t>(writer.native_handle())));
+      }
+      if (worker.joinable()) {
+        worker.join();
+      }
+      if (writer.joinable()) writer.join();
+      if (stop_event) CloseHandle(stop_event);
+    }
+
+    int alloc(const gamepad_id_t &id, const gamepad_arrival_t &metadata,
+        feedback_queue_t feedback_queue) {
+      if (id.globalIndex < 0 || id.globalIndex >= MAX_GAMEPADS) return -1;
+
+      auto &slot = slots[id.globalIndex];
+      std::lock_guard lock(slot.mutex);
+      if (slot.active) return -1;
+      slot.controller_id = static_cast<std::uint16_t>(id.globalIndex);
+      slot.client_index = id.clientRelativeIndex;
+      slot.metadata = metadata;
+      slot.feedback_queue = std::move(feedback_queue);
+      slot.last_state = {};
+      slot.sequence = 0;
+      slot.active = true;
+
+      // Accept the controller before DS4Windows connects. The worker keeps
+      // the latest state and replays Arrival + State after the pipe handshake,
+      // so either application can start first without losing the controller.
+      const bool arrival_queued = send(make_arrival(slot, next_sequence(slot)));
+      BOOST_LOG(info) << "DS4 bridge controller allocated (controller="
+                      << id.globalIndex << ", arrival_queued="
+                      << arrival_queued << ')';
+      return 0;
+    }
+
+    void free(int index) {
+      if (index < 0 || index >= MAX_GAMEPADS) return;
+      auto &slot = slots[index];
+      std::array<std::uint8_t, RECORD_LENGTH> packet;
+      {
+        std::lock_guard lock(slot.mutex);
+        if (!slot.active) return;
+        packet = make_packet(packet_kind_e::remove, slot,
+            next_sequence(slot));
+        slot.active = false;
+        send(packet);
+        BOOST_LOG(info) << "DS4 bridge controller released (controller="
+                        << index << ')';
+      }
+    }
+
+    void update(int index, const gamepad_state_t &state) {
+      auto *slot = get_slot(index);
+      if (!slot) return;
+      std::array<std::uint8_t, RECORD_LENGTH> packet;
+      {
+        std::lock_guard lock(slot->mutex);
+        if (!slot->active) return;
+        const auto log_gamepad_state = [&](const char *reason) {
+          BOOST_LOG(info) << "DS4Windows bridge received " << reason << " gamepad state (controller="
+                          << index << ", buttons=0x"
+                          << util::hex(state.buttonFlags).to_string_view()
+                          << ", triggers=" << static_cast<unsigned>(state.lt) << ','
+                          << static_cast<unsigned>(state.rt)
+                          << ", left_stick=" << state.lsX << ',' << state.lsY
+                          << ", right_stick=" << state.rsX << ',' << state.rsY << ')';
+        };
+        if (!logged_first_gamepad_state.exchange(true, std::memory_order_relaxed)) {
+          log_gamepad_state("the first");
+        }
+        const bool non_neutral = state.buttonFlags != 0 || state.lt != 0 || state.rt != 0 ||
+                                 state.lsX != 0 || state.lsY != 0 || state.rsX != 0 || state.rsY != 0;
+        if (non_neutral && !logged_non_neutral_gamepad_state.exchange(true, std::memory_order_relaxed)) {
+          log_gamepad_state("a non-neutral");
+        }
+        slot->last_state = state;
+        packet = make_state(*slot, state, next_sequence(*slot));
+        send(packet);
+        auto now = std::chrono::steady_clock::now();
+        if (now - slot->last_gyro_motion_ts > MOTION_RE_REQUEST_AFTER &&
+            now - slot->last_motion_request_ts > MOTION_RE_REQUEST_COOLDOWN) {
+          request_motion(*slot, now);
+        }
+      }
+    }
+
+    void request_motion(int index) {
+      auto *slot = get_slot(index);
+      if (!slot) return;
+      std::lock_guard lock(slot->mutex);
+      if (slot->active)
+        request_motion(*slot, std::chrono::steady_clock::now());
+    }
+
+    void touch(int index, const gamepad_touch_t &event) {
+      auto *slot = get_slot(index);
+      if (!slot) return;
+      std::array<std::uint8_t, RECORD_LENGTH> packet;
+      {
+        std::lock_guard lock(slot->mutex);
+        if (!slot->active) return;
+        packet = make_touch(*slot, event, next_sequence(*slot));
+        send(packet);
+      }
+    }
+
+    void motion(int index, const gamepad_motion_t &event) {
+      auto *slot = get_slot(index);
+      if (!slot) return;
+      std::array<std::uint8_t, RECORD_LENGTH> packet;
+      {
+        std::lock_guard lock(slot->mutex);
+        if (!slot->active) return;
+        if (event.motionType == LI_MOTION_TYPE_GYRO)
+          slot->last_gyro_motion_ts = std::chrono::steady_clock::now();
+        packet = make_motion(*slot, event, next_sequence(*slot));
+        send(packet);
+      }
+    }
+
+    void battery(int index, const gamepad_battery_t &event) {
+      auto *slot = get_slot(index);
+      if (!slot) return;
+      std::array<std::uint8_t, RECORD_LENGTH> packet;
+      {
+        std::lock_guard lock(slot->mutex);
+        if (!slot->active) return;
+        packet = make_battery(*slot, event, next_sequence(*slot));
+        send(packet);
+      }
+    }
+
+  private:
+    struct slot_t {
+      std::mutex mutex;
+      bool active {};
+      std::uint16_t controller_id {};
+      std::uint8_t client_index {};
+      gamepad_arrival_t metadata {};
+      gamepad_state_t last_state {};
+      std::chrono::steady_clock::time_point last_gyro_motion_ts {};
+      std::chrono::steady_clock::time_point last_motion_request_ts {};
+      std::uint32_t sequence {};
+      feedback_queue_t feedback_queue;
+    };
+
+    static void request_motion(slot_t &slot,
+        std::chrono::steady_clock::time_point now) {
+      if (!slot.feedback_queue) return;
+      slot.feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(
+          slot.client_index, LI_MOTION_TYPE_ACCEL, 100));
+      slot.feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(
+          slot.client_index, LI_MOTION_TYPE_GYRO, 100));
+      slot.last_motion_request_ts = now;
+    }
+
+    static std::uint64_t make_session_id() {
+      LARGE_INTEGER counter {};
+      QueryPerformanceCounter(&counter);
+      std::uint64_t value = static_cast<std::uint64_t>(counter.QuadPart);
+      value ^= static_cast<std::uint64_t>(GetTickCount64()) << 17;
+      value ^= static_cast<std::uint64_t>(GetCurrentProcessId()) << 32;
+      return value == 0 ? 1 : value;
+    }
+
+    static void write_u16(std::array<std::uint8_t, RECORD_LENGTH> &record,
+        std::size_t offset, std::uint16_t value) {
+      record[offset] = static_cast<std::uint8_t>(value);
+      record[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+    }
+
+    static void write_u32(std::array<std::uint8_t, RECORD_LENGTH> &record,
+        std::size_t offset, std::uint32_t value) {
+      for (int i = 0; i < 4; ++i)
+        record[offset + i] = static_cast<std::uint8_t>(value >> (i * 8));
+    }
+
+    static void write_u64(std::array<std::uint8_t, RECORD_LENGTH> &record,
+        std::size_t offset, std::uint64_t value) {
+      for (int i = 0; i < 8; ++i)
+        record[offset + i] = static_cast<std::uint8_t>(value >> (i * 8));
+    }
+
+    static void write_float(std::array<std::uint8_t, RECORD_LENGTH> &record,
+        std::size_t offset, float value) {
+      write_u32(record, offset, std::bit_cast<std::uint32_t>(value));
+    }
+
+    std::array<std::uint8_t, RECORD_LENGTH> make_packet(packet_kind_e kind,
+        const slot_t &slot, std::uint32_t sequence) const {
+      std::array<std::uint8_t, RECORD_LENGTH> record {};
+      record[0] = 'V'; record[1] = 'S'; record[2] = 'C'; record[3] = 'B';
+      write_u16(record, 4, VERSION);
+      record[6] = static_cast<std::uint8_t>(kind);
+      write_u16(record, 8, slot.controller_id);
+      record[10] = slot.client_index;
+      write_u32(record, 12, sequence);
+      write_u64(record, 16, session_id);
+      return record;
+    }
+
+    std::array<std::uint8_t, RECORD_LENGTH> make_arrival(
+        const slot_t &slot, std::uint32_t sequence) const {
+      auto record = make_packet(packet_kind_e::arrival, slot, sequence);
+      record[24] = slot.metadata.type;
+      write_u16(record, 25, slot.metadata.capabilities);
+      write_u32(record, 27, slot.metadata.supportedButtons);
+      return record;
+    }
+
+    std::array<std::uint8_t, RECORD_LENGTH> make_state(const slot_t &slot,
+        const gamepad_state_t &state, std::uint32_t sequence) const {
+      auto record = make_packet(packet_kind_e::state, slot, sequence);
+      write_u32(record, 24, state.buttonFlags);
+      record[28] = state.lt; record[29] = state.rt;
+      write_u16(record, 30, static_cast<std::uint16_t>(state.lsX));
+      write_u16(record, 32, static_cast<std::uint16_t>(state.lsY));
+      write_u16(record, 34, static_cast<std::uint16_t>(state.rsX));
+      write_u16(record, 36, static_cast<std::uint16_t>(state.rsY));
+      return record;
+    }
+
+    std::array<std::uint8_t, RECORD_LENGTH> make_touch(const slot_t &slot,
+        const gamepad_touch_t &event, std::uint32_t sequence) const {
+      auto record = make_packet(packet_kind_e::touch, slot, sequence);
+      record[24] = event.eventType;
+      write_u32(record, 28, event.pointerId);
+      write_float(record, 32, event.x);
+      write_float(record, 36, event.y);
+      write_float(record, 40, event.pressure);
+      return record;
+    }
+
+    std::array<std::uint8_t, RECORD_LENGTH> make_motion(const slot_t &slot,
+        const gamepad_motion_t &event, std::uint32_t sequence) const {
+      auto record = make_packet(packet_kind_e::motion, slot, sequence);
+      record[24] = event.motionType;
+      write_float(record, 28, event.x);
+      write_float(record, 32, event.y);
+      write_float(record, 36, event.z);
+      return record;
+    }
+
+    std::array<std::uint8_t, RECORD_LENGTH> make_battery(const slot_t &slot,
+        const gamepad_battery_t &event, std::uint32_t sequence) const {
+      auto record = make_packet(packet_kind_e::battery, slot, sequence);
+      record[24] = event.state;
+      record[25] = event.percentage;
+      return record;
+    }
+
+    static std::uint32_t next_sequence(slot_t &slot) {
+      return slot.sequence++;
+    }
+
+    slot_t *get_slot(int index) {
+      return index >= 0 && index < MAX_GAMEPADS ? &slots[index] : nullptr;
+    }
+
+    static bool transfer_all(HANDLE pipe, std::uint8_t *data,
+        std::size_t length, bool writing, HANDLE stop_event) {
+      HANDLE io_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      if (!io_event) return false;
+      std::size_t offset = 0;
+      while (offset < length) {
+        OVERLAPPED overlapped {};
+        overlapped.hEvent = io_event;
+        ResetEvent(io_event);
+
+        DWORD transferred = 0;
+        BOOL completed = writing ?
+            WriteFile(pipe, data + offset,
+                static_cast<DWORD>(length - offset), &transferred, &overlapped) :
+            ReadFile(pipe, data + offset,
+                static_cast<DWORD>(length - offset), &transferred, &overlapped);
+        if (!completed) {
+          const DWORD error = GetLastError();
+          if (error != ERROR_IO_PENDING) {
+            CloseHandle(io_event);
+            return false;
+          }
+
+          HANDLE wait_handles[] {stop_event, io_event};
+          const DWORD wait_result = WaitForMultipleObjects(
+              2, wait_handles, FALSE, INFINITE);
+          if (wait_result != WAIT_OBJECT_0 + 1) {
+            CancelIoEx(pipe, &overlapped);
+            GetOverlappedResult(pipe, &overlapped, &transferred, TRUE);
+            CloseHandle(io_event);
+            return false;
+          }
+          if (!GetOverlappedResult(pipe, &overlapped, &transferred, FALSE)) {
+            CloseHandle(io_event);
+            return false;
+          }
+        }
+        if (transferred == 0) {
+          CloseHandle(io_event);
+          return false;
+        }
+        offset += transferred;
+      }
+      CloseHandle(io_event);
+      return true;
+    }
+
+    static bool write_all(HANDLE pipe,
+        const std::array<std::uint8_t, RECORD_LENGTH> &record,
+        HANDLE stop_event) {
+      return transfer_all(pipe,
+          const_cast<std::uint8_t *>(record.data()), record.size(), true,
+          stop_event);
+    }
+
+    static bool read_all(HANDLE pipe,
+        std::array<std::uint8_t, RECORD_LENGTH> &record,
+        HANDLE stop_event) {
+      return transfer_all(pipe, record.data(), record.size(), false,
+          stop_event);
+    }
+
+    static std::uint16_t read_u16(
+        const std::array<std::uint8_t, RECORD_LENGTH> &record,
+        std::size_t offset) {
+      return static_cast<std::uint16_t>(record[offset] |
+          (static_cast<std::uint16_t>(record[offset + 1]) << 8));
+    }
+
+    static std::uint32_t read_u32(
+        const std::array<std::uint8_t, RECORD_LENGTH> &record,
+        std::size_t offset) {
+      std::uint32_t value = 0;
+      for (int i = 0; i < 4; ++i)
+        value |= static_cast<std::uint32_t>(record[offset + i]) << (i * 8);
+      return value;
+    }
+
+    static std::uint64_t read_u64(
+        const std::array<std::uint8_t, RECORD_LENGTH> &record,
+        std::size_t offset) {
+      std::uint64_t value = 0;
+      for (int i = 0; i < 8; ++i)
+        value |= static_cast<std::uint64_t>(record[offset + i]) << (i * 8);
+      return value;
+    }
+
+    void send_hello(HANDLE pipe) {
+      slot_t hello_slot {};
+      auto hello = make_packet(packet_kind_e::hello, hello_slot, 0);
+      write_all(pipe, hello, stop_event);
+    }
+
+    HANDLE open_pipe() {
+      for (int attempt = 0; attempt < 8 &&
+          !stopping.load(std::memory_order_acquire); ++attempt) {
+        if (WaitNamedPipeA(PIPE_NAME, 500)) {
+          HANDLE pipe = CreateFileA(PIPE_NAME, GENERIC_READ | GENERIC_WRITE,
+              0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+          if (pipe != INVALID_HANDLE_VALUE) return pipe;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+      return INVALID_HANDLE_VALUE;
+    }
+
+    bool handshake(HANDLE pipe) {
+      send_hello(pipe);
+      std::array<std::uint8_t, RECORD_LENGTH> reply {};
+      return read_all(pipe, reply, stop_event) && reply[0] == 'V' && reply[1] == 'S' &&
+          reply[2] == 'C' && reply[3] == 'B' &&
+          read_u16(reply, 4) == VERSION &&
+          reply[6] == static_cast<std::uint8_t>(packet_kind_e::hello_accepted) &&
+          read_u64(reply, 16) == session_id;
+    }
+
+    bool send(const std::array<std::uint8_t, RECORD_LENGTH> &record) {
+      if (!connected.load(std::memory_order_acquire)) {
+        if (!logged_unavailable_send.exchange(true, std::memory_order_relaxed)) {
+          BOOST_LOG(warning) << "DS4Windows controller bridge has no connected peer; the current controller state will be replayed after reconnect"sv;
+        }
+        return false;
+      }
+
+      // The input task pool has a single worker. Never make it wait for a
+      // named-pipe reader: DS4Windows handles Arrival synchronously, so a slow
+      // device setup can stop pipe reads and eventually block every host input.
+      {
+        std::lock_guard lock(outgoing_mutex);
+        if (!connected.load(std::memory_order_acquire)) return false;
+
+        const auto kind = record[6];
+        const bool replaceable = kind == static_cast<std::uint8_t>(packet_kind_e::state) ||
+                                 kind == static_cast<std::uint8_t>(packet_kind_e::motion) ||
+                                 kind == static_cast<std::uint8_t>(packet_kind_e::battery);
+        if (replaceable) {
+          const auto controller = read_u16(record, 8);
+          const auto same_latest = std::find_if(outgoing.rbegin(), outgoing.rend(), [&](const auto &queued) {
+            return queued[6] == kind && read_u16(queued, 8) == controller;
+          });
+          if (same_latest != outgoing.rend()) {
+            *same_latest = record;
+            outgoing_cv.notify_one();
+            return true;
+          }
+        }
+
+        constexpr std::size_t MAX_PENDING_RECORDS = 256;
+        if (outgoing.size() >= MAX_PENDING_RECORDS) {
+          const auto discard = std::find_if(outgoing.begin(), outgoing.end(), [](const auto &queued) {
+            const auto queued_kind = queued[6];
+            return queued_kind == static_cast<std::uint8_t>(packet_kind_e::state) ||
+                   queued_kind == static_cast<std::uint8_t>(packet_kind_e::motion) ||
+                   queued_kind == static_cast<std::uint8_t>(packet_kind_e::battery);
+          });
+          if (discard != outgoing.end()) {
+            outgoing.erase(discard);
+          } else if (replaceable) {
+            if (!logged_queue_full.exchange(true, std::memory_order_relaxed)) {
+              BOOST_LOG(warning) << "DS4Windows controller bridge queue is full; dropping replaceable controller reports"sv;
+            }
+            return false;
+          } else {
+            outgoing.pop_front();
+            if (!logged_queue_full.exchange(true, std::memory_order_relaxed)) {
+              BOOST_LOG(warning) << "DS4Windows controller bridge queue is full; evicting the oldest queued record to preserve a control event"sv;
+            }
+          }
+        }
+
+        outgoing.emplace_back(record);
+      }
+      outgoing_cv.notify_one();
+      return true;
+    }
+
+    void write_loop() {
+      while (!stopping.load(std::memory_order_acquire)) {
+        std::array<std::uint8_t, RECORD_LENGTH> record {};
+        {
+          std::unique_lock lock(outgoing_mutex);
+          outgoing_cv.wait(lock, [this]() {
+            return stopping.load(std::memory_order_acquire) ||
+                   (!outgoing.empty() && connected.load(std::memory_order_acquire));
+          });
+          if (stopping.load(std::memory_order_acquire)) break;
+          record = outgoing.front();
+          outgoing.pop_front();
+        }
+
+        const auto started = std::chrono::steady_clock::now();
+        bool written = false;
+        const auto kind = static_cast<packet_kind_e>(record[6]);
+        if (kind == packet_kind_e::arrival) {
+          BOOST_LOG(debug) << "Writing DS4Windows bridge controller arrival (controller=" << read_u16(record, 8) << ')';
+        }
+        {
+          std::lock_guard lock(pipe_mutex);
+          if (pipe != INVALID_HANDLE_VALUE && connected.load(std::memory_order_acquire)) {
+            written = write_all(pipe, record, stop_event);
+          }
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
+        if (!written) {
+          if (!logged_failed_send.exchange(true, std::memory_order_relaxed)) {
+            BOOST_LOG(warning) << "Writing a controller report to the DS4Windows bridge pipe failed"sv;
+          }
+          continue;
+        }
+
+        if (elapsed >= std::chrono::milliseconds(50)) {
+          if (!logged_slow_write.exchange(true, std::memory_order_relaxed)) {
+            BOOST_LOG(warning) << "DS4Windows bridge pipe write took " << elapsed.count()
+                               << "ms (kind=" << static_cast<unsigned>(record[6])
+                               << "); host input processing remains decoupled"sv;
+          }
+        }
+        if (kind == packet_kind_e::arrival) {
+          BOOST_LOG(debug) << "Wrote DS4Windows bridge controller arrival (controller=" << read_u16(record, 8)
+                           << ", elapsed_ms=" << elapsed.count() << ')';
+        }
+        if (record[6] == static_cast<std::uint8_t>(packet_kind_e::state) &&
+            logged_state_reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+          BOOST_LOG(debug) << "Forwarded gamepad state to the DS4Windows bridge (controller=" << read_u16(record, 8)
+                           << ", buttons=0x" << util::hex(read_u32(record, 24)).to_string_view()
+                           << ", left_stick=" << static_cast<std::int16_t>(read_u16(record, 30)) << ','
+                           << static_cast<std::int16_t>(read_u16(record, 32))
+                           << ", right_stick=" << static_cast<std::int16_t>(read_u16(record, 34)) << ','
+                           << static_cast<std::int16_t>(read_u16(record, 36)) << ')';
+        }
+      }
+    }
+
+    void resend_active_slots() {
+      int active_slots = 0;
+      for (int index = 0; index < MAX_GAMEPADS; ++index) {
+        auto &slot = slots[index];
+        std::lock_guard lock(slot.mutex);
+        if (!slot.active) continue;
+        ++active_slots;
+        bool arrival_queued = send(make_arrival(slot, next_sequence(slot)));
+        bool state_queued = send(make_state(slot, slot.last_state,
+            next_sequence(slot)));
+        BOOST_LOG(info) << "Replaying DS4 bridge controller (controller="
+                        << index << ", arrival_queued=" << arrival_queued
+                        << ", state_queued=" << state_queued << ')';
+        request_motion(slot, std::chrono::steady_clock::now());
+      }
+      BOOST_LOG(info) << "DS4 bridge reconnect replay checked " << active_slots
+                      << " active controller slot(s)";
+    }
+
+    void handle_feedback(
+        const std::array<std::uint8_t, RECORD_LENGTH> &record) {
+      if (record[0] != 'V' || record[1] != 'S' || record[2] != 'C' ||
+          record[3] != 'B' || read_u16(record, 4) != VERSION ||
+          record[6] != static_cast<std::uint8_t>(packet_kind_e::feedback) ||
+          read_u64(record, 16) != session_id) return;
+      int index = read_u16(record, 8);
+      if (index < 0 || index >= MAX_GAMEPADS) return;
+
+      auto &slot = slots[index];
+      std::lock_guard lock(slot.mutex);
+      if (!slot.active || record[10] != slot.client_index) return;
+      auto kind = static_cast<feedback_kind_e>(record[24]);
+      switch (kind) {
+        case feedback_kind_e::rumble:
+          slot.feedback_queue->raise(gamepad_feedback_msg_t::make_rumble(
+              slot.client_index,
+              static_cast<std::uint16_t>(record[25]) << 8,
+              static_cast<std::uint16_t>(record[26]) << 8));
+          break;
+        case feedback_kind_e::rumble_triggers:
+          slot.feedback_queue->raise(gamepad_feedback_msg_t::make_rumble_triggers(
+              slot.client_index,
+              static_cast<std::uint16_t>(record[25]) << 8,
+              static_cast<std::uint16_t>(record[26]) << 8));
+          break;
+        case feedback_kind_e::motion_event_state:
+          slot.feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(
+              slot.client_index, record[32], read_u16(record, 30)));
+          break;
+        case feedback_kind_e::rgb_led:
+          slot.feedback_queue->raise(gamepad_feedback_msg_t::make_rgb_led(
+              slot.client_index, record[27], record[28], record[29]));
+          break;
+        case feedback_kind_e::adaptive_triggers: {
+          std::array<std::uint8_t, 10> left {}, right {};
+          std::copy_n(record.begin() + 36, 10, left.begin());
+          std::copy_n(record.begin() + 46, 10, right.begin());
+          slot.feedback_queue->raise(gamepad_feedback_msg_t::make_adaptive_triggers(
+              slot.client_index, record[33], record[34], record[35], left, right));
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    void run() {
+      while (!stopping.load(std::memory_order_acquire)) {
+        HANDLE candidate = open_pipe();
+        if (candidate == INVALID_HANDLE_VALUE) continue;
+        if (!handshake(candidate)) {
+          CloseHandle(candidate);
+          continue;
+        }
+
+        {
+          std::lock_guard lock(pipe_mutex);
+          pipe = candidate;
+          connected.store(true, std::memory_order_release);
+        }
+        BOOST_LOG(info) << "DS4Windows controller bridge pipe handshake completed"sv;
+        outgoing_cv.notify_one();
+        resend_active_slots();
+
+        while (!stopping.load(std::memory_order_acquire)) {
+          std::array<std::uint8_t, RECORD_LENGTH> record {};
+          if (!read_all(candidate, record, stop_event)) break;
+          handle_feedback(record);
+        }
+
+        // A broken/blocked peer must not leave the write worker holding the
+        // pipe lock forever while the reader tries to reconnect.
+        connected.store(false, std::memory_order_release);
+        if (writer.joinable()) {
+          CancelIoEx(candidate, nullptr);
+        }
+        {
+          std::lock_guard lock(pipe_mutex);
+          if (pipe == candidate) pipe = INVALID_HANDLE_VALUE;
+        }
+        {
+          std::lock_guard lock(outgoing_mutex);
+          outgoing.clear();
+        }
+        outgoing_cv.notify_all();
+        CloseHandle(candidate);
+      }
+    }
+
+    const std::uint64_t session_id;
+    std::array<slot_t, MAX_GAMEPADS> slots;
+    std::atomic<bool> stopping {};
+    std::atomic<bool> connected {};
+    std::atomic<bool> logged_unavailable_send {};
+    std::atomic<bool> logged_failed_send {};
+    std::atomic<bool> logged_queue_full {};
+    std::atomic<bool> logged_slow_write {};
+    std::atomic<bool> logged_first_gamepad_state {};
+    std::atomic<bool> logged_non_neutral_gamepad_state {};
+    std::atomic<std::uint32_t> logged_state_reports {};
+    std::mutex pipe_mutex;
+    HANDLE pipe {INVALID_HANDLE_VALUE};
+    std::thread worker;
+    std::mutex outgoing_mutex;
+    std::condition_variable outgoing_cv;
+    std::deque<std::array<std::uint8_t, RECORD_LENGTH>> outgoing;
+    HANDLE stop_event {nullptr};
+    std::thread writer;
   };
 
   constexpr float EARTH_G = 9.80665f;
@@ -484,7 +1181,8 @@ namespace platf {
     none,
     vigem,
     vhf,
-    usbip
+    usbip,
+    ds4windows
   };
 
   struct input_raw_t {
@@ -492,11 +1190,13 @@ namespace platf {
       delete vigem;
       delete vhf;
       delete usbip;
+      delete sunshine;
     }
 
     vigem_t *vigem;
     vhf_gamepad_t *vhf;
     usbip_gamepad_t *usbip;
+    sunshine_controller_bridge_t *sunshine;
 
     // Slots are allocated one at a time, so both backends can own gamepads simultaneously.
     std::array<gamepad_backend_e, MAX_GAMEPADS> gamepad_backend {};
@@ -577,6 +1277,11 @@ namespace platf {
 
     raw.usbip = new usbip_gamepad_t {};
     const bool usbip_available = raw.usbip->probe();
+
+    // The app-to-app pipe is only needed when its explicit config option is enabled.
+    if (config::input.ds4windows_bridge) {
+      raw.sunshine = new sunshine_controller_bridge_t {};
+    }
 
     raw.vigem = new vigem_t {};
     raw.vigem->vhf_gamepad_available = vhf_available || usbip_available;
@@ -1300,6 +2005,19 @@ namespace platf {
       return -1;
     }
 
+    if (config::input.ds4windows_bridge) {
+      if (!raw->sunshine || raw->sunshine->alloc(id, metadata, std::move(feedback_queue)) != 0) {
+        BOOST_LOG(error) << "Gamepad " << id.globalIndex
+                         << " could not connect to the DS4Windows controller bridge"sv;
+        return -1;
+      }
+      raw->gamepad_backend[id.globalIndex] = gamepad_backend_e::ds4windows;
+      raw->sunshine->request_motion(id.globalIndex);
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex
+                      << " is using DS4Windows as its controller owner"sv;
+      return 0;
+    }
+
     // Composite USB is an explicit selection or an application-scoped
     // waveform-haptics requirement. It never replaces Automatic globally.
     if (config::input.gamepad == "usbip_ds5"sv || dualsense_usbip_gamepad::enabled()) {
@@ -1424,6 +2142,11 @@ namespace platf {
       if (raw->vhf) {
         raw->vhf->free(nr);
       }
+      return;
+    }
+
+    if (backend == gamepad_backend_e::ds4windows) {
+      if (raw->sunshine) raw->sunshine->free(nr);
       return;
     }
 
@@ -1713,6 +2436,12 @@ namespace platf {
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state) {
     auto raw = (input_raw_t *) input.get();
 
+    if (nr >= 0 && nr < MAX_GAMEPADS &&
+        raw->gamepad_backend[nr] == gamepad_backend_e::ds4windows) {
+      if (raw->sunshine) raw->sunshine->update(nr, gamepad_state);
+      return;
+    }
+
     if (usbip_owns_gamepad(raw, nr)) {
       raw->usbip->update(nr, gamepad_state);
       return;
@@ -1756,6 +2485,12 @@ namespace platf {
    */
   void gamepad_touch(input_t &input, const gamepad_touch_t &touch) {
     auto raw = (input_raw_t *) input.get();
+
+    if (touch.id.globalIndex >= 0 && touch.id.globalIndex < MAX_GAMEPADS &&
+        raw->gamepad_backend[touch.id.globalIndex] == gamepad_backend_e::ds4windows) {
+      if (raw->sunshine) raw->sunshine->touch(touch.id.globalIndex, touch);
+      return;
+    }
 
     if (usbip_owns_gamepad(raw, touch.id.globalIndex)) {
       raw->usbip->touch(touch.id.globalIndex, touch);
@@ -1876,6 +2611,12 @@ namespace platf {
   void gamepad_motion(input_t &input, const gamepad_motion_t &motion) {
     auto raw = (input_raw_t *) input.get();
 
+    if (motion.id.globalIndex >= 0 && motion.id.globalIndex < MAX_GAMEPADS &&
+        raw->gamepad_backend[motion.id.globalIndex] == gamepad_backend_e::ds4windows) {
+      if (raw->sunshine) raw->sunshine->motion(motion.id.globalIndex, motion);
+      return;
+    }
+
     if (usbip_owns_gamepad(raw, motion.id.globalIndex)) {
       raw->usbip->motion(motion.id.globalIndex, motion);
       return;
@@ -1922,6 +2663,12 @@ namespace platf {
    */
   void gamepad_battery(input_t &input, const gamepad_battery_t &battery) {
     auto raw = (input_raw_t *) input.get();
+
+    if (battery.id.globalIndex >= 0 && battery.id.globalIndex < MAX_GAMEPADS &&
+        raw->gamepad_backend[battery.id.globalIndex] == gamepad_backend_e::ds4windows) {
+      if (raw->sunshine) raw->sunshine->battery(battery.id.globalIndex, battery);
+      return;
+    }
 
     if (usbip_owns_gamepad(raw, battery.id.globalIndex)) {
       raw->usbip->battery(battery.id.globalIndex, battery);
@@ -2013,6 +2760,7 @@ namespace platf {
         supported_gamepad_t {"auto", true, ""},
         supported_gamepad_t {"x360", false, ""},
         supported_gamepad_t {"ds4", false, ""},
+        supported_gamepad_t {"ds4windows", false, ""},
         supported_gamepad_t {"vhf", false, ""},
         supported_gamepad_t {"vhf_xbox", false, ""},
         supported_gamepad_t {"vhf_xbox_one", false, ""},
@@ -2034,12 +2782,15 @@ namespace platf {
 
     auto usbip_enabled = raw->usbip != nullptr && raw->usbip->available();
     auto usbip_reason = usbip_enabled ? "" : "gamepads.usbip-not-available";
+    auto ds4windows_enabled = raw->sunshine != nullptr;
+    auto ds4windows_reason = ds4windows_enabled ? "" : "gamepads.ds4windows-not-available";
 
     // ds4 == ps4
     static std::vector gps {
       supported_gamepad_t {"auto", enabled || vhf_enabled, enabled || vhf_enabled ? "" : reason},
       supported_gamepad_t {"x360", enabled, reason},
       supported_gamepad_t {"ds4", enabled, reason},
+      supported_gamepad_t {"ds4windows", ds4windows_enabled, ds4windows_reason},
       supported_gamepad_t {"vhf", vhf_enabled, vhf_reason},
       supported_gamepad_t {"vhf_xbox", vhf_enabled, vhf_reason},
       supported_gamepad_t {"vhf_xbox_one", vhf_enabled, vhf_reason},
@@ -2052,7 +2803,7 @@ namespace platf {
     // A gamepad type that is unavailable only because its backend is not installed is not
     // worth a warning when another backend is providing controllers; it is just an option the
     // user is not using.
-    const bool any_backend = enabled || vhf_enabled || usbip_enabled;
+    const bool any_backend = enabled || vhf_enabled || usbip_enabled || ds4windows_enabled;
     for (auto &[name, is_enabled, reason_disabled] : gps) {
       if (is_enabled) {
         continue;

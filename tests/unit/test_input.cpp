@@ -72,6 +72,38 @@ TEST(InputValidation, RejectsUnknownMagic) {
   EXPECT_FALSE(input::validation::validate_packet(bytes));
 }
 
+TEST(InputValidation, AcceptsLegacyMultiControllerPacketMagic) {
+  NV_MULTI_CONTROLLER_PACKET packet {};
+  auto bytes = packet_bytes(packet);
+  write_u32_be(bytes, 0, sizeof(packet) - sizeof(packet.header.size));
+  write_u32_le(bytes, sizeof(packet.header.size), MULTI_CONTROLLER_MAGIC);
+
+  const auto result = input::validation::validate_packet(bytes);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(result.magic, MULTI_CONTROLLER_MAGIC);
+}
+
+TEST(InputValidation, DistinguishesLegacyHapticsAndControllerPackets) {
+  NV_HAPTICS_PACKET haptics {};
+  auto haptics_bytes = packet_bytes(haptics);
+  write_u32_be(haptics_bytes, 0, sizeof(haptics) - sizeof(haptics.header.size));
+  write_u32_le(haptics_bytes, sizeof(haptics.header.size), ENABLE_HAPTICS_MAGIC);
+  EXPECT_TRUE(input::validation::validate_packet(haptics_bytes));
+  EXPECT_TRUE(input::validation::is_haptics_packet(ENABLE_HAPTICS_MAGIC, haptics_bytes.size()));
+
+  NV_MULTI_CONTROLLER_PACKET controller {};
+  auto controller_bytes = packet_bytes(controller);
+  write_u32_be(controller_bytes, 0, sizeof(controller) - sizeof(controller.header.size));
+  write_u32_le(controller_bytes, sizeof(controller.header.size), MULTI_CONTROLLER_MAGIC);
+  EXPECT_TRUE(input::validation::validate_packet(controller_bytes));
+  EXPECT_FALSE(input::validation::is_haptics_packet(MULTI_CONTROLLER_MAGIC, controller_bytes.size()));
+
+  auto malformed = packet_bytes(controller, sizeof(controller) - 1);
+  write_u32_be(malformed, 0, sizeof(controller) - sizeof(controller.header.size) - 1);
+  write_u32_le(malformed, sizeof(controller.header.size), MULTI_CONTROLLER_MAGIC);
+  EXPECT_FALSE(input::validation::validate_packet(malformed));
+}
+
 TEST(InputTouchMapping, NormalizesUsingPlatformOffsetContract) {
   input::validation::touch_port_t touch_port {
     1920,

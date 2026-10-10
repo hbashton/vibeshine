@@ -48,6 +48,7 @@ namespace input::validation {
    * @return Validation details, including the parsed packet when valid.
    */
   packet_validation_result_t validate_packet(const std::vector<std::uint8_t> &input_data);
+  bool is_haptics_packet(std::uint32_t magic, std::size_t total_size);
 
   struct touch_port_t {
     int offset_x = 0;

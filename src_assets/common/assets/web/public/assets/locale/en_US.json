@@ -589,6 +589,8 @@
     "file_state_desc": "The file where current state of Vibeshine is stored",
     "gamepad": "Emulated Gamepad Type",
     "gamepad_auto": "Automatic selection options",
+    "ds4windows_bridge": "Send controller input directly to DS4Windows",
+    "ds4windows_bridge_desc": "Let DS4Windows create the game-facing virtual controller. This bypasses Sunshine's virtual controller and sends Moonlight controls, motion, touch, and battery data over a local pipe. Enable the matching option in DS4Windows too.",
     "gamepad_desc": "Choose which type of gamepad to emulate on the host",
     "gamepad_ds4": "DS4 (PS4)",
     "gamepad_ds4_manual": "DS4 selection options",
