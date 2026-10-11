@@ -1098,7 +1098,7 @@ namespace VDISPLAY_SUDOVDA {
       return active_virtual_display_tracker().contains(guid);
     }
 
-    std::vector<VDISPLAY::TrackedDisplayCleanupTarget> tracked_display_cleanup_targets() {
+    std::vector<VDISPLAY::TrackedDisplayCleanupTarget> tracked_display_cleanup_targets_impl() {
       std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
       std::vector<VDISPLAY::TrackedDisplayCleanupTarget> result;
       for (const auto &guid_uuid : active_virtual_display_tracker().all()) {
@@ -1114,7 +1114,7 @@ namespace VDISPLAY_SUDOVDA {
       return result;
     }
 
-    bool tracked_display_cleanup_target_matches(
+    bool tracked_display_cleanup_target_matches_impl(
       const std::array<std::uint8_t, 16> &guid_bytes,
       const std::string &device_id) {
       if (device_id.empty()) return false;
@@ -1127,10 +1127,10 @@ namespace VDISPLAY_SUDOVDA {
              boost::iequals(identity->second.device_id, device_id);
     }
 
-    bool remove_tracked_display_cleanup_target(const VDISPLAY::TrackedDisplayCleanupTarget &target) {
+    bool remove_tracked_display_cleanup_target_impl(const VDISPLAY::TrackedDisplayCleanupTarget &target) {
       if (target.backend != VDISPLAY::ensure_display_backend_e::sudovda || target.device_id.empty()) return false;
       std::lock_guard<std::recursive_mutex> operation_lock(g_virtual_display_operation_mutex);
-      if (!tracked_display_cleanup_target_matches(target.guid_bytes, target.device_id)) return false;
+      if (!tracked_display_cleanup_target_matches_impl(target.guid_bytes, target.device_id)) return false;
       GUID guid {};
       static_assert(sizeof(guid) == sizeof(target.guid_bytes));
       std::memcpy(&guid, target.guid_bytes.data(), sizeof(guid));
@@ -2999,6 +2999,21 @@ namespace VDISPLAY_SUDOVDA {
       }
     }
   }  // namespace
+
+  std::vector<VDISPLAY::TrackedDisplayCleanupTarget> tracked_display_cleanup_targets() {
+    return tracked_display_cleanup_targets_impl();
+  }
+
+  bool tracked_display_cleanup_target_matches(
+    const std::array<std::uint8_t, 16> &guid_bytes,
+    const std::string &device_id
+  ) {
+    return tracked_display_cleanup_target_matches_impl(guid_bytes, device_id);
+  }
+
+  bool remove_tracked_display_cleanup_target(const VDISPLAY::TrackedDisplayCleanupTarget &target) {
+    return remove_tracked_display_cleanup_target_impl(target);
+  }
 
   void applyHdrProfileToOutput(const char *s_client_name, const char *s_hdr_profile, const char *s_device_id) {
     // Only apply HDR profiles when explicitly selected by the user.

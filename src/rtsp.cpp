@@ -709,6 +709,7 @@ namespace rtsp_stream {
       if (ec) {
         return -1;
       }
+      BOOST_LOG(info) << "Connection trace: RTSP listener bound address=" << bind_addr_str << ':' << port;
 
       startup_pool.start(1);
 
@@ -753,13 +754,18 @@ namespace rtsp_stream {
       const auto remote_endpoint = socket->sock.remote_endpoint(endpoint_ec);
       const auto remote_address = endpoint_ec ? std::string {} : remote_endpoint.address().to_string();
       const auto candidates = route_candidates(remote_address);
+      BOOST_LOG(info) << "Connection trace: RTSP accepted peer=" << remote_address
+                      << ':' << (endpoint_ec ? 0 : remote_endpoint.port())
+                      << " pending_plaintext=" << candidates.plaintext
+                      << " pending_encrypted=" << candidates.encrypted.size();
       if (candidates.plaintext || !candidates.encrypted.empty()) {
         socket->plaintext_candidate = candidates.plaintext;
         socket->encrypted_candidates = candidates.encrypted;
         socket->read();
       } else {
-        // This can happen due to normal things like port scanning, so let's not make these visible by default
-        BOOST_LOG(debug) << "No pending session for incoming RTSP connection"sv;
+        // This can happen due to normal things like port scanning. Keep it at
+        // info temporarily so failed client handoffs can be diagnosed.
+        BOOST_LOG(info) << "Connection trace: RTSP connection has no pending launch for peer=" << remote_address;
 
         // If there is no session pending, close the connection immediately
         boost::system::error_code ec;
@@ -849,7 +855,9 @@ namespace rtsp_stream {
       // Function arguments may move the session before the map key is read.
       const auto launch_session_id = launch_session->id;
       const auto expires_at = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+      const bool encrypted = static_cast<bool>(launch_session->rtsp_cipher);
       bool accepted = false;
+      std::size_t pending_count = 0;
       std::vector<std::shared_ptr<launch_session_t>> expired;
       {
         std::lock_guard lock {pending_launches_mutex};
@@ -867,7 +875,11 @@ namespace rtsp_stream {
           pending_launches.emplace(launch_session_id, pending_launch_t {std::move(launch_session), expires_at});
           accepted = true;
         }
+        pending_count = pending_launches.size();
       }
+      BOOST_LOG(info) << "Connection trace: RTSP pending launch " << (accepted ? "admitted" : "rejected")
+                      << " encrypted=" << encrypted
+                      << " pending=" << pending_count;
       notify_expired_pending(expired);
       if (accepted) {
         set_pending_vulkan_hdr_layer_stream(pending_hdr_active());
@@ -2236,6 +2248,7 @@ namespace rtsp_stream {
 
   void start() {
     platf::set_thread_name("rtsp");
+    BOOST_LOG(info) << "Connection trace: RTSP service worker entered"sv;
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
 
     server.map("OPTIONS"sv, &cmd_option);
@@ -2254,6 +2267,7 @@ namespace rtsp_stream {
 
     std::thread rtsp_thread {[&shutdown_event] {
       platf::set_thread_name("rtsp::handler");
+      BOOST_LOG(info) << "Connection trace: RTSP socket handler worker entered"sv;
       auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
 
       while (!shutdown_event->peek() || server.startup_count() > 0) {
@@ -2268,6 +2282,7 @@ namespace rtsp_stream {
       }
 
       server.clear();
+      BOOST_LOG(info) << "Connection trace: RTSP socket handler worker stopped"sv;
     }};
 
     // Wait for shutdown

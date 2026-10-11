@@ -4412,10 +4412,14 @@ namespace confighttp {
    * @api_examples{/api/pin| POST| {"pin":"1234","name":"My PC"}}
    */
   void savePin(resp_https_t response, req_https_t request) {
+    const auto handler_started = std::chrono::steady_clock::now();
+    BOOST_LOG(info) << "Connection trace: config /api/pin handler entered"sv;
     if (!check_content_type(response, request, "application/json")) {
+      BOOST_LOG(warning) << "Connection trace: config /api/pin rejected content type"sv;
       return;
     }
     if (!authenticate(response, request)) {
+      BOOST_LOG(warning) << "Connection trace: config /api/pin authentication rejected"sv;
       return;
     }
 
@@ -4436,11 +4440,18 @@ namespace confighttp {
       }
 
       output_tree["status"] = nvhttp::pin(pin, name);
+      BOOST_LOG(info) << "Connection trace: config /api/pin completed (accepted="
+                      << output_tree["status"].get<bool>()
+                      << ", duration_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - handler_started).count() << ')';
       if (!output_tree["status"].get<bool>()) {
         BOOST_LOG(warning) << "SavePin: no pending Moonlight pairing request accepted the submitted PIN";
       }
       send_response(response, output_tree);
     } catch (std::exception &e) {
+      BOOST_LOG(warning) << "Connection trace: config /api/pin failed after "
+                         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - handler_started).count() << "ms";
       BOOST_LOG(warning) << "SavePin: "sv << e.what();
       bad_request(response, request, e.what());
     }
@@ -5592,6 +5603,7 @@ namespace confighttp {
 
   void start() {
     platf::set_thread_name("confighttp");
+    BOOST_LOG(info) << "Connection trace: config HTTPS service worker entered"sv;
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
 
     auto port_https = net::map_port(PORT_HTTPS);
@@ -5620,11 +5632,18 @@ namespace confighttp {
     blocking_route_pool.start(1);
     clear_token_route_catalog();
     auto register_api_route = [&](const char *pattern, const char *method, const auto &handler) {
-      server.resource[pattern][method] = [method, handler](resp_https_t response, req_https_t request) {
+      const bool trace_pin_route = std::string_view {pattern} == "^/api/pin$"sv;
+      server.resource[pattern][method] = [method, handler, trace_pin_route](resp_https_t response, req_https_t request) {
+        if (trace_pin_route) {
+          BOOST_LOG(info) << "Connection trace: config /api/pin request reached route dispatcher"sv;
+        }
         const std::string_view verb {method};
         if (verb == "POST" || verb == "PATCH" || verb == "PUT" || verb == "DELETE") {
           const auto client_id = get_client_id(request);
           if (!validate_csrf_token(response, request, client_id)) {
+            if (trace_pin_route) {
+              BOOST_LOG(warning) << "Connection trace: config /api/pin rejected by CSRF validation"sv;
+            }
             return;
           }
         }
@@ -5775,11 +5794,14 @@ namespace confighttp {
     server.config.reuse_address = true;
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
+    BOOST_LOG(info) << "Connection trace: config HTTPS routes configured; binding listener port=" << port_https;
 
     auto accept_and_run = [&](auto *server) {
       try {
         platf::set_thread_name("confighttp::tcp");
+        BOOST_LOG(info) << "Connection trace: config HTTPS listener thread starting port=" << port_https;
         server->start([](unsigned short) {
+          BOOST_LOG(info) << "Connection trace: config HTTPS listener ready"sv;
           BOOST_LOG(info) << "Configuration UI available at ["sv << get_web_ui_url() << "]";
         });
       } catch (boost::system::system_error &err) {

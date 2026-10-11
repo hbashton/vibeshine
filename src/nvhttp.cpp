@@ -737,31 +737,68 @@ namespace nvhttp {
     // This is Server<HTTPS>::accept() with SSL validation support added
     void accept() override {
       auto connection = create_connection(*io_service, context);
+      BOOST_LOG(debug) << "Connection trace: NVHTTP TLS accept armed"sv;
 
       acceptor->async_accept(connection->socket->lowest_layer(), [this, connection](const SimpleWeb::error_code &ec) {
+        const bool listener_open = acceptor && acceptor->is_open();
         auto lock = connection->handler_runner->continue_lock();
         if (!lock) {
+          SimpleWeb::error_code peer_endpoint_ec;
+          const auto peer_endpoint = !ec ? connection->socket->lowest_layer().remote_endpoint(peer_endpoint_ec) : boost::asio::ip::tcp::endpoint {};
+          const auto peer_label = peer_endpoint_ec ? "unknown peer"s :
+            (!ec ? peer_endpoint.address().to_string() + ':' + std::to_string(peer_endpoint.port()) : "none"s);
+          BOOST_LOG(warning) << "Connection trace: NVHTTP TLS accept completion arrived after the handler stopped"
+                            << " result=" << (ec ? ec.message() : "ok"s)
+                            << " peer=" << peer_label
+                            << " listener_open=" << listener_open;
+          // A canceled accept can race with listener shutdown. If the acceptor is
+          // still open, keep the listener alive even if the previous handler
+          // scope was stopped while its completion was queued.
+          if (listener_open) {
+            BOOST_LOG(warning) << "Connection trace: NVHTTP TLS accept rearmed after stopped handler"sv;
+            this->accept();
+          }
           return;
         }
 
-        if (ec != SimpleWeb::error::operation_aborted) {
-          this->accept();
+        if (ec == SimpleWeb::error::operation_aborted) {
+          const bool listener_open = acceptor && acceptor->is_open();
+          BOOST_LOG(warning) << "Connection trace: NVHTTP TLS accept canceled; listener_open=" << listener_open;
+          if (listener_open) {
+            BOOST_LOG(info) << "Connection trace: NVHTTP TLS accept loop rearmed after unexpected cancellation"sv;
+            this->accept();
+          }
+          return;
         }
+
+        if (ec) {
+          BOOST_LOG(warning) << "Connection trace: NVHTTP TLS accept failed: "sv << ec.message();
+        }
+        this->accept();
 
         auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
 
         if (!ec) {
+          SimpleWeb::error_code peer_endpoint_ec;
+          const auto peer_endpoint = session->connection->socket->lowest_layer().remote_endpoint(peer_endpoint_ec);
+          const auto peer_label = peer_endpoint_ec ? "unknown peer"s :
+            peer_endpoint.address().to_string() + ':' + std::to_string(peer_endpoint.port());
+          BOOST_LOG(info) << "Connection trace: NVHTTP TLS accepted peer=" << peer_label;
+
           boost::asio::ip::tcp::no_delay option(true);
           SimpleWeb::error_code ec;
           session->connection->socket->lowest_layer().set_option(option, ec);
 
           session->connection->set_timeout(config.timeout_request);
-          session->connection->socket->async_handshake(boost::asio::ssl::stream_base::server, [this, session](const SimpleWeb::error_code &ec) {
+          BOOST_LOG(info) << "Connection trace: NVHTTP TLS handshake started peer=" << peer_label;
+          session->connection->socket->async_handshake(boost::asio::ssl::stream_base::server, [this, session, peer_label](const SimpleWeb::error_code &ec) {
             session->connection->cancel_timeout();
             auto lock = session->connection->handler_runner->continue_lock();
             if (!lock) {
               return;
             }
+            BOOST_LOG(info) << "Connection trace: NVHTTP TLS handshake finished peer=" << peer_label
+                            << " result=" << (ec ? ec.message() : "ok"s);
             if (!ec) {
               SimpleWeb::error_code remote_endpoint_ec;
               const auto remote_endpoint = session->connection->socket->lowest_layer().remote_endpoint(remote_endpoint_ec);
@@ -772,11 +809,18 @@ namespace nvhttp {
                 return;
               }
 
-              if (verify && !verify(session->connection->socket->native_handle(), remote_endpoint)) {
-                this->write(session, on_verify_failed);
-              } else {
-                this->read(session);
+              if (verify) {
+                BOOST_LOG(info) << "Connection trace: NVHTTP TLS certificate verification entered peer=" << peer_label;
+                const auto verify_result = verify(session->connection->socket->native_handle(), remote_endpoint);
+                BOOST_LOG(info) << "Connection trace: NVHTTP TLS certificate verification finished peer=" << peer_label
+                                << " result=" << (verify_result ? "accepted"sv : "rejected"sv);
+                if (!verify_result) {
+                  this->write(session, on_verify_failed);
+                  return;
+                }
               }
+              BOOST_LOG(info) << "Connection trace: NVHTTP TLS HTTP read armed peer=" << peer_label;
+              this->read(session);
             } else if (this->on_error) {
               this->on_error(session->request, ec);
             }
@@ -3397,7 +3441,13 @@ namespace nvhttp {
   template<class T>
   void unpair(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
-    std::lock_guard pairing_lock {pairing_sessions_mutex};
+    const auto lock_wait_started = std::chrono::steady_clock::now();
+    BOOST_LOG(info) << "Connection trace: NVHTTP unpair waiting for pairing lock"sv;
+    std::unique_lock pairing_lock {pairing_sessions_mutex};
+    BOOST_LOG(info) << "Connection trace: NVHTTP unpair acquired pairing lock (wait_ms="
+                    << std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - lock_wait_started).count()
+                    << ')';
 
     pt::ptree tree;
 
@@ -3432,11 +3482,27 @@ namespace nvhttp {
   template<class T>
   void pair(std::shared_ptr<safe::queue_t<crypto::x509_t>> &add_cert, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
-    std::lock_guard pairing_lock {pairing_sessions_mutex};
+    const auto handler_started = std::chrono::steady_clock::now();
+    const auto remote_endpoint = request->remote_endpoint();
+    const auto remote_address = remote_endpoint.address().to_string();
+    const auto lock_wait_started = std::chrono::steady_clock::now();
+    BOOST_LOG(info) << "Connection trace: NVHTTP pairing handler entered peer=" << remote_address
+                    << ':' << remote_endpoint.port() << "; waiting for pairing lock";
+    std::unique_lock pairing_lock {pairing_sessions_mutex};
+    const auto pairing_lock_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - lock_wait_started);
 
     pt::ptree tree;
+    std::string_view pairing_phase = "initial"sv;
 
     auto fg = util::fail_guard([&]() {
+      BOOST_LOG(info) << "Connection trace: NVHTTP pairing response peer=" << remote_address
+                      << " phase=" << pairing_phase
+                      << " status=" << tree.get("root.<xmlattr>.status_code", "unspecified")
+                      << " pending=" << map_id_sess.size()
+                      << " lock_wait_ms=" << pairing_lock_wait.count()
+                      << " handler_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - handler_started).count();
       std::ostringstream data;
 
       pt::write_xml(data, tree);
@@ -3445,6 +3511,27 @@ namespace nvhttp {
     });
 
     auto args = request->parse_query_string();
+    if (const auto phrase_it = args.find("phrase"s); phrase_it != std::end(args)) {
+      if (phrase_it->second == "getservercert"sv) {
+        pairing_phase = "getservercert"sv;
+      } else if (phrase_it->second == "pairchallenge"sv) {
+        pairing_phase = "pairchallenge"sv;
+      } else {
+        pairing_phase = "other-phrase"sv;
+      }
+    } else if (args.find("clientchallenge"s) != std::end(args)) {
+      pairing_phase = "clientchallenge"sv;
+    } else if (args.find("serverchallengeresp"s) != std::end(args)) {
+      pairing_phase = "serverchallengeresp"sv;
+    } else if (args.find("clientpairingsecret"s) != std::end(args)) {
+      pairing_phase = "clientpairingsecret"sv;
+    }
+    BOOST_LOG(info) << "Connection trace: NVHTTP pairing request peer=" << remote_address
+                    << ':' << remote_endpoint.port()
+                    << " phase=" << pairing_phase
+                    << " uniqueid_present=" << (args.find("uniqueid"s) != std::end(args))
+                    << " pending=" << map_id_sess.size()
+                    << " lock_wait_ms=" << pairing_lock_wait.count();
     if (args.find("uniqueid"s) == std::end(args)) {
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", "Missing uniqueid parameter");
@@ -3483,6 +3570,9 @@ namespace nvhttp {
           same_identity
         );
         if (!admission.accepted) {
+          BOOST_LOG(warning) << "Connection trace: NVHTTP pairing admission rejected peer=" << remote_address
+                             << " reason=" << admission.failure_message
+                             << " pending=" << map_id_sess.size();
           tree.put("root.<xmlattr>.status_code", admission.failure_message == "Too many pending pairing sessions"sv ? 429 : 400);
           tree.put("root.<xmlattr>.status_message", admission.failure_message);
           return;
@@ -3519,6 +3609,8 @@ namespace nvhttp {
 #endif
           ptr->second.async_insert_pin.response = std::move(response);
 
+          BOOST_LOG(info) << "Connection trace: NVHTTP pairing waiting for PIN peer=" << remote_address
+                          << " pending=" << map_id_sess.size();
           fg.disable();
           return;
         }
@@ -3531,6 +3623,9 @@ namespace nvhttp {
 
     auto sess_it = map_id_sess.find(uniqID);
     if (sess_it == std::end(map_id_sess)) {
+      BOOST_LOG(warning) << "Connection trace: NVHTTP pairing phase has no matching session peer=" << remote_address
+                         << " phase=" << pairing_phase
+                         << " pending=" << map_id_sess.size();
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", "Invalid uniqueid");
 
@@ -3568,9 +3663,15 @@ namespace nvhttp {
   }
 
   bool pin(std::string pin, std::string name) {
-    std::lock_guard pairing_lock {pairing_sessions_mutex};
+    const auto lock_wait_started = std::chrono::steady_clock::now();
+    BOOST_LOG(info) << "Connection trace: NVHTTP PIN handler waiting for pairing lock"sv;
+    std::unique_lock pairing_lock {pairing_sessions_mutex};
     pt::ptree tree;
     expire_pairing_sessions_locked(std::chrono::steady_clock::now());
+    BOOST_LOG(info) << "Connection trace: NVHTTP PIN handler acquired pairing lock (wait_ms="
+                    << std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - lock_wait_started).count()
+                    << ", pending=" << map_id_sess.size() << ')';
     if (map_id_sess.empty()) {
       BOOST_LOG(warning) << "PIN submitted but no pending pairing session exists";
       return false;
@@ -3634,6 +3735,8 @@ namespace nvhttp {
       remove_session(sess);
       return false;
     }
+    BOOST_LOG(info) << "Connection trace: NVHTTP PIN response delivered pending=" << map_id_sess.size()
+                    << " status=" << tree.get("root.<xmlattr>.status_code", "unspecified");
 
     // reset async_response
     async_response = std::decay_t<decltype(async_response.left())>();
@@ -3651,6 +3754,12 @@ namespace nvhttp {
     }
 
     auto local_endpoint = request->local_endpoint();
+    const auto remote_endpoint = request->remote_endpoint();
+    BOOST_LOG(debug) << "Connection trace: NVHTTP serverinfo peer=" << remote_endpoint.address().to_string()
+                     << ':' << remote_endpoint.port()
+                     << " local=" << local_endpoint.address().to_string()
+                     << " tls=" << std::is_same_v<SunshineHTTPS, T>
+                     << " pair_status=" << pair_status;
 
     pt::ptree tree;
 
@@ -3951,6 +4060,9 @@ namespace nvhttp {
 
   void applist(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
+    const auto remote_endpoint = request->remote_endpoint();
+    BOOST_LOG(debug) << "Connection trace: NVHTTP applist peer=" << remote_endpoint.address().to_string()
+                     << ':' << remote_endpoint.port();
 
     pt::ptree tree;
 
@@ -4029,6 +4141,9 @@ namespace nvhttp {
 
   void launch(bool &host_audio, resp_https_t response, req_https_t request, int current_appid) {
     print_req<SunshineHTTPS>(request);
+    const auto remote_endpoint = request->remote_endpoint();
+    BOOST_LOG(info) << "Connection trace: NVHTTP launch request peer=" << remote_endpoint.address().to_string()
+                    << ':' << remote_endpoint.port();
 
 #ifdef _WIN32
     // Keep encoder probes blocked across the complete failure unwind: virtual
@@ -4043,6 +4158,10 @@ namespace nvhttp {
       if (tree.empty()) {
         BOOST_LOG(error) << EMPTY_PROPERTY_TREE_ERROR_MSG;
       }
+
+      BOOST_LOG(info) << "Connection trace: NVHTTP launch response peer=" << remote_endpoint.address().to_string()
+                      << ':' << remote_endpoint.port()
+                      << " status=" << tree.get("root.<xmlattr>.status_code", "unspecified");
 
       pt::write_xml(data, tree);
       response->write(data.str());
@@ -4861,6 +4980,9 @@ namespace nvhttp {
 
   void resume(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, const bool normal_app_transition, const bool launched_from_applist) {
     print_req<SunshineHTTPS>(request);
+    const auto remote_endpoint = request->remote_endpoint();
+    BOOST_LOG(info) << "Connection trace: NVHTTP resume request peer=" << remote_endpoint.address().to_string()
+                    << ':' << remote_endpoint.port();
 
 #ifdef _WIN32
     // See launch(): the response fail guard can restore through the helper
@@ -4875,6 +4997,10 @@ namespace nvhttp {
       if (tree.empty()) {
         BOOST_LOG(error) << EMPTY_PROPERTY_TREE_ERROR_MSG;
       }
+
+      BOOST_LOG(info) << "Connection trace: NVHTTP resume response peer=" << remote_endpoint.address().to_string()
+                      << ':' << remote_endpoint.port()
+                      << " status=" << tree.get("root.<xmlattr>.status_code", "unspecified");
 
       pt::write_xml(data, tree);
       response->write(data.str());
@@ -5735,6 +5861,7 @@ namespace nvhttp {
 
   void start() {
     platf::set_thread_name("nvhttp");
+    BOOST_LOG(info) << "Connection trace: NVHTTP service worker entered"sv;
 #if defined(_WIN32) || defined(__linux__)
     // The listeners below can accept /launch as soon as they are started.
     // Install the concrete coordinator callbacks before exposing that route.
@@ -5757,15 +5884,18 @@ namespace nvhttp {
         shutdown_event->raise(true);
         return;
       }
+      BOOST_LOG(info) << "Connection trace: NVHTTP pairing state loaded"sv;
     } else {
       // FRESH_STATE is an explicit, non-persistent test/reset mode. It is the
       // only path allowed to operate without a durable state snapshot.
       authorization_state_ready.store(true, std::memory_order_release);
+      BOOST_LOG(info) << "Connection trace: NVHTTP clean-slate state initialized"sv;
     }
 
     auto pkey = file_handler::read_file(config::nvhttp.pkey.c_str());
     auto cert = file_handler::read_file(config::nvhttp.cert.c_str());
     setup(pkey, cert);
+    BOOST_LOG(info) << "Connection trace: NVHTTP TLS key and certificate loaded"sv;
 
     auto add_cert = std::make_shared<safe::queue_t<crypto::x509_t>>(30);
 
@@ -5785,6 +5915,7 @@ namespace nvhttp {
 
     // Verify certificates after establishing connection
     https_server.verify = [add_cert](SSL *ssl, const boost::asio::ip::tcp::endpoint &remote_endpoint) {
+      const auto verification_started = std::chrono::steady_clock::now();
       forget_tls_client_identity(remote_endpoint);
 
       crypto::x509_t x509_verify {
@@ -5810,8 +5941,15 @@ namespace nvhttp {
 
       const char *err_str = nullptr;
       std::optional<resolved_client_identity_t> identity;
+      const auto client_lock_wait_started = std::chrono::steady_clock::now();
+      BOOST_LOG(info) << "Connection trace: NVHTTP TLS verification waiting for client state peer="
+                      << remote_endpoint.address().to_string() << ':' << remote_endpoint.port();
       {
         std::lock_guard<std::mutex> lock(client_mutex);
+        BOOST_LOG(info) << "Connection trace: NVHTTP TLS verification acquired client state peer="
+                        << remote_endpoint.address().to_string() << ':' << remote_endpoint.port()
+                        << " lock_wait_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - client_lock_wait_started).count();
         while (add_cert->peek()) {
           auto cert = add_cert->pop();
           const auto subject_name = cert_subject_name_for_log(cert);
@@ -5832,6 +5970,10 @@ namespace nvhttp {
           }
         }
       }
+      BOOST_LOG(info) << "Connection trace: NVHTTP TLS verification checked client state peer="
+                      << remote_endpoint.address().to_string() << ':' << remote_endpoint.port()
+                      << " duration_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - verification_started).count();
       if (err_str) {
         BOOST_LOG(warning) << "SSL Verification error :: "sv << err_str;
 
@@ -5857,15 +5999,25 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
     };
 
-    auto run_on_blocking_pool = [](thread_pool_util::ThreadPool &pool, auto task) {
-      pool.push([task = std::move(task)]() mutable {
+    BOOST_LOG(info) << "Connection trace: NVHTTP routes initializing after TLS and HTTP server configuration"sv;
+    auto run_on_blocking_pool = [](thread_pool_util::ThreadPool &pool, const char *operation, auto task) {
+      const auto queued_at = std::chrono::steady_clock::now();
+      BOOST_LOG(info) << "Connection trace: NVHTTP route queued op=" << operation;
+      pool.push([task = std::move(task), operation, queued_at]() mutable {
+        const auto started_at = std::chrono::steady_clock::now();
+        const auto queue_wait = std::chrono::duration_cast<std::chrono::milliseconds>(started_at - queued_at);
+        BOOST_LOG(info) << "Connection trace: NVHTTP route started op=" << operation
+                        << " queue_wait_ms=" << queue_wait.count();
         try {
           task();
         } catch (const std::exception &e) {
-          BOOST_LOG(error) << "Blocking NVHTTP handler failed: " << e.what();
+          BOOST_LOG(error) << "Connection trace: NVHTTP route threw op=" << operation << ": " << e.what();
         } catch (...) {
-          BOOST_LOG(error) << "Blocking NVHTTP handler failed with an unknown exception";
+          BOOST_LOG(error) << "Connection trace: NVHTTP route threw op=" << operation << " with unknown exception";
         }
+        BOOST_LOG(info) << "Connection trace: NVHTTP route finished op=" << operation
+                        << " duration_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - started_at).count();
       });
     };
 
@@ -5874,11 +6026,13 @@ namespace nvhttp {
     // a response and must never execute stale mutations after a client timeout.
     auto mutation_admission = std::make_shared<single_flight::admission_t>();
     auto run_blocking_nvhttp = [&blocking_route_pool, run_on_blocking_pool, mutation_admission](auto response, const char *operation, auto task) {
+      BOOST_LOG(info) << "Connection trace: NVHTTP mutating route received op=" << operation;
       if (mutation_admission->try_submit([&](auto admitted) {
-            run_on_blocking_pool(blocking_route_pool, std::move(admitted));
+            run_on_blocking_pool(blocking_route_pool, operation, std::move(admitted));
           }, std::move(task))) {
         return;
       }
+      BOOST_LOG(warning) << "Connection trace: NVHTTP mutating route rejected as busy op=" << operation;
       pt::ptree tree;
       tree.put(std::string("root.") + operation, 0);
       tree.put("root.<xmlattr>.status_code", 503);
@@ -5889,14 +6043,14 @@ namespace nvhttp {
       response->write(data.str());
     };
 
-    auto run_discovery_nvhttp = [&discovery_route_pool, run_on_blocking_pool](auto task) {
-      run_on_blocking_pool(discovery_route_pool, std::move(task));
+    auto run_discovery_nvhttp = [&discovery_route_pool, run_on_blocking_pool](const char *operation, auto task) {
+      run_on_blocking_pool(discovery_route_pool, operation, std::move(task));
     };
 
     https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
     https_server.default_resource["POST"] = not_found<SunshineHTTPS>;
     https_server.resource["^/serverinfo$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
-      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
+      run_discovery_nvhttp("serverinfo", [resp = std::move(resp), req = std::move(req)]() mutable {
         serverinfo<SunshineHTTPS>(std::move(resp), std::move(req));
       });
     };
@@ -5909,7 +6063,7 @@ namespace nvhttp {
     https_server.resource["^/unpair/?$"]["GET"] = unpair<SunshineHTTPS>;
     https_server.resource["^/unpair/?$"]["POST"] = unpair<SunshineHTTPS>;
     https_server.resource["^/applist$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
-      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
+      run_discovery_nvhttp("applist", [resp = std::move(resp), req = std::move(req)]() mutable {
         applist(std::move(resp), std::move(req));
       });
     };
@@ -5936,7 +6090,15 @@ namespace nvhttp {
         cancel(std::move(resp), std::move(req));
       });
     };
-    https_server.resource["^/bitrate$"]["GET"] = setBitrate;
+    // A bitrate request can release the last stream reference while a disconnect
+    // is tearing down the broadcast. That cleanup joins the broadcast threads,
+    // so it must not run on the single HTTPS accept loop or reconnects stop being
+    // accepted until the join completes.
+    https_server.resource["^/bitrate$"]["GET"] = [run_blocking_nvhttp](auto response, auto request) {
+      run_blocking_nvhttp(response, "bitrate", [response, request = std::move(request)]() mutable {
+        setBitrate(std::move(response), std::move(request));
+      });
+    };
     https_server.resource["^/api/abr/capabilities$"]["GET"] = getAbrCapabilities;
     https_server.resource["^/pyrowave-bandwidth-probe$"]["GET"] = getPyroWaveBandwidthProbe;
     https_server.resource["^/pyrowave-udp-probe$"]["GET"] = [run_blocking_nvhttp](auto resp, auto req) {
@@ -5953,7 +6115,7 @@ namespace nvhttp {
     http_server.default_resource["GET"] = not_found<SimpleWeb::HTTP>;
     http_server.default_resource["POST"] = not_found<SimpleWeb::HTTP>;
     http_server.resource["^/serverinfo$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
-      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
+      run_discovery_nvhttp("serverinfo-http", [resp = std::move(resp), req = std::move(req)]() mutable {
         serverinfo<SimpleWeb::HTTP>(std::move(resp), std::move(req));
       });
     };
@@ -5971,11 +6133,15 @@ namespace nvhttp {
     http_server.config.address = net::get_bind_address(address_family);
     http_server.config.port = port_http;
 
+    BOOST_LOG(info) << "Connection trace: NVHTTP route tables configured; binding HTTP/HTTPS listeners"sv;
+
     auto accept_and_run = [&](auto *http_server) {
       try {
         std::string name = "nvhttp::" + std::to_string(http_server->config.port);
         platf::set_thread_name(name);
+        BOOST_LOG(info) << "Connection trace: NVHTTP listener thread starting port=" << http_server->config.port;
         http_server->start();
+        BOOST_LOG(info) << "Connection trace: NVHTTP listener thread stopped port=" << http_server->config.port;
       } catch (boost::system::system_error &err) {
         // It's possible the exception gets thrown after calling http_server->stop() from a different thread
         if (shutdown_event->peek()) {
@@ -5989,6 +6155,8 @@ namespace nvhttp {
     };
     std::thread ssl {accept_and_run, &https_server};
     std::thread tcp {accept_and_run, &http_server};
+    BOOST_LOG(info) << "Connection trace: NVHTTP listener threads launched http_port=" << port_http
+                    << " https_port=" << port_https;
     std::jthread pairing_expiry_worker([](std::stop_token stop_token) {
       platf::set_thread_name("pair_expiry");
       while (!stop_token.stop_requested()) {
@@ -6004,7 +6172,9 @@ namespace nvhttp {
     });
 
     // Wait for any event
+    BOOST_LOG(info) << "Connection trace: NVHTTP listeners ready; waiting for shutdown"sv;
     shutdown_event->view();
+    BOOST_LOG(info) << "Connection trace: NVHTTP shutdown event received; stopping listeners and route workers"sv;
 
 #ifdef __linux__
     if (const char *machine_host = std::getenv("VIBESHINE_MACHINE_HOST"); machine_host && machine_host[0] == '1' && machine_host[1] == '\0') {
@@ -6026,6 +6196,7 @@ namespace nvhttp {
     blocking_route_pool.join();
     discovery_route_pool.stop();
     discovery_route_pool.join();
+    BOOST_LOG(info) << "Connection trace: NVHTTP listener and route workers stopped"sv;
     webrtc_stream::shutdown_all_sessions();
     rtsp_stream::terminate_sessions(false);
     remote_session::notify_monitor_shutdown();

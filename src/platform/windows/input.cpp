@@ -136,6 +136,7 @@ namespace platf {
 
     sunshine_controller_bridge_t():
         session_id {make_session_id()} {
+      BOOST_LOG(info) << "Connection trace: DS4Windows bridge starting dedicated reader and writer workers"sv;
       stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
       if (!stop_event) {
         throw std::runtime_error("Could not create the DS4Windows bridge stop event");
@@ -143,6 +144,7 @@ namespace platf {
       try {
         worker = std::thread {[this]() { run(); }};
         writer = std::thread {[this]() { write_loop(); }};
+        BOOST_LOG(info) << "Connection trace: DS4Windows bridge workers started"sv;
       } catch (...) {
         stopping.store(true, std::memory_order_release);
         SetEvent(stop_event);
@@ -424,10 +426,12 @@ namespace platf {
     }
 
     static bool transfer_all(HANDLE pipe, std::uint8_t *data,
-        std::size_t length, bool writing, HANDLE stop_event) {
+        std::size_t length, bool writing, HANDLE stop_event, std::uint8_t trace_kind = 0) {
       HANDLE io_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
       if (!io_event) return false;
       std::size_t offset = 0;
+      const auto transfer_started = std::chrono::steady_clock::now();
+      auto last_stall_log = std::chrono::steady_clock::time_point {};
       while (offset < length) {
         OVERLAPPED overlapped {};
         overlapped.hEvent = io_event;
@@ -447,8 +451,22 @@ namespace platf {
           }
 
           HANDLE wait_handles[] {stop_event, io_event};
-          const DWORD wait_result = WaitForMultipleObjects(
-              2, wait_handles, FALSE, INFINITE);
+          DWORD wait_result = WAIT_TIMEOUT;
+          do {
+            wait_result = WaitForMultipleObjects(
+                2, wait_handles, FALSE, trace_kind ? 1000 : INFINITE);
+            if (wait_result == WAIT_TIMEOUT && trace_kind) {
+              const auto now = std::chrono::steady_clock::now();
+              if (last_stall_log == std::chrono::steady_clock::time_point {} ||
+                  now - last_stall_log >= std::chrono::seconds(2)) {
+                last_stall_log = now;
+                BOOST_LOG(warning) << "Connection trace: DS4 bridge pipe write is still pending (kind="
+                                   << static_cast<unsigned>(trace_kind)
+                                   << ", elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          now - transfer_started).count() << ')';
+              }
+            }
+          } while (wait_result == WAIT_TIMEOUT && trace_kind);
           if (wait_result != WAIT_OBJECT_0 + 1) {
             CancelIoEx(pipe, &overlapped);
             GetOverlappedResult(pipe, &overlapped, &transferred, TRUE);
@@ -475,7 +493,7 @@ namespace platf {
         HANDLE stop_event) {
       return transfer_all(pipe,
           const_cast<std::uint8_t *>(record.data()), record.size(), true,
-          stop_event);
+          stop_event, record[6]);
     }
 
     static bool read_all(HANDLE pipe,
@@ -551,7 +569,14 @@ namespace platf {
       // named-pipe reader: DS4Windows handles Arrival synchronously, so a slow
       // device setup can stop pipe reads and eventually block every host input.
       {
-        std::lock_guard lock(outgoing_mutex);
+        const auto lock_wait_started = std::chrono::steady_clock::now();
+        std::unique_lock lock(outgoing_mutex);
+        const auto lock_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - lock_wait_started);
+        if (lock_wait >= std::chrono::milliseconds(10)) {
+          BOOST_LOG(warning) << "Connection trace: DS4 bridge enqueue waited for queue lock "
+                             << lock_wait.count() << "ms (queued=" << outgoing.size() << ')';
+        }
         if (!connected.load(std::memory_order_acquire)) return false;
 
         const auto kind = record[6];
@@ -600,8 +625,13 @@ namespace platf {
     }
 
     void write_loop() {
+      BOOST_LOG(info) << "Connection trace: DS4 bridge writer worker entered"sv;
+      auto last_slow_write_log = std::chrono::steady_clock::time_point {};
+      auto last_failed_write_log = std::chrono::steady_clock::time_point {};
+      auto last_backlog_log = std::chrono::steady_clock::time_point {};
       while (!stopping.load(std::memory_order_acquire)) {
         std::array<std::uint8_t, RECORD_LENGTH> record {};
+        std::size_t pending_after_dequeue = 0;
         {
           std::unique_lock lock(outgoing_mutex);
           outgoing_cv.wait(lock, [this]() {
@@ -611,35 +641,59 @@ namespace platf {
           if (stopping.load(std::memory_order_acquire)) break;
           record = outgoing.front();
           outgoing.pop_front();
+          pending_after_dequeue = outgoing.size();
         }
 
-        const auto started = std::chrono::steady_clock::now();
+        const auto lock_wait_started = std::chrono::steady_clock::now();
         bool written = false;
         const auto kind = static_cast<packet_kind_e>(record[6]);
         if (kind == packet_kind_e::arrival) {
           BOOST_LOG(debug) << "Writing DS4Windows bridge controller arrival (controller=" << read_u16(record, 8) << ')';
         }
+        std::chrono::milliseconds pipe_lock_wait {};
+        std::chrono::milliseconds write_duration {};
         {
-          std::lock_guard lock(pipe_mutex);
+          std::unique_lock lock(pipe_mutex);
+          const auto write_started = std::chrono::steady_clock::now();
+          pipe_lock_wait = std::chrono::duration_cast<std::chrono::milliseconds>(write_started - lock_wait_started);
           if (pipe != INVALID_HANDLE_VALUE && connected.load(std::memory_order_acquire)) {
             written = write_all(pipe, record, stop_event);
           }
+          write_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - write_started);
         }
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started);
+        const auto elapsed = pipe_lock_wait + write_duration;
         if (!written) {
-          if (!logged_failed_send.exchange(true, std::memory_order_relaxed)) {
-            BOOST_LOG(warning) << "Writing a controller report to the DS4Windows bridge pipe failed"sv;
+          const auto now = std::chrono::steady_clock::now();
+          if (last_failed_write_log == std::chrono::steady_clock::time_point {} ||
+              now - last_failed_write_log >= std::chrono::seconds(2)) {
+            last_failed_write_log = now;
+            BOOST_LOG(warning) << "Connection trace: DS4 bridge pipe write failed (kind="
+                               << static_cast<unsigned>(record[6])
+                               << ", lock_wait_ms=" << pipe_lock_wait.count()
+                               << ", write_ms=" << write_duration.count()
+                               << ", queued=" << pending_after_dequeue << ')';
           }
           continue;
         }
 
-        if (elapsed >= std::chrono::milliseconds(50)) {
-          if (!logged_slow_write.exchange(true, std::memory_order_relaxed)) {
-            BOOST_LOG(warning) << "DS4Windows bridge pipe write took " << elapsed.count()
-                               << "ms (kind=" << static_cast<unsigned>(record[6])
-                               << "); host input processing remains decoupled"sv;
-          }
+        const auto now = std::chrono::steady_clock::now();
+        if (elapsed >= std::chrono::milliseconds(50) &&
+            (last_slow_write_log == std::chrono::steady_clock::time_point {} ||
+             now - last_slow_write_log >= std::chrono::seconds(2))) {
+          last_slow_write_log = now;
+          BOOST_LOG(warning) << "Connection trace: DS4 bridge pipe write slow (kind="
+                             << static_cast<unsigned>(record[6])
+                             << ", lock_wait_ms=" << pipe_lock_wait.count()
+                             << ", write_ms=" << write_duration.count()
+                             << ", queued=" << pending_after_dequeue << ')';
+        }
+        if (pending_after_dequeue >= 32 &&
+            (last_backlog_log == std::chrono::steady_clock::time_point {} ||
+             now - last_backlog_log >= std::chrono::seconds(2))) {
+          last_backlog_log = now;
+          BOOST_LOG(warning) << "Connection trace: DS4 bridge writer backlog is " << pending_after_dequeue
+                             << " records after dequeue"sv;
         }
         if (kind == packet_kind_e::arrival) {
           BOOST_LOG(debug) << "Wrote DS4Windows bridge controller arrival (controller=" << read_u16(record, 8)
@@ -724,10 +778,25 @@ namespace platf {
     }
 
     void run() {
+      BOOST_LOG(info) << "Connection trace: DS4 bridge reader worker entered; waiting for DS4Windows pipe"sv;
+      bool logged_pipe_missing = false;
       while (!stopping.load(std::memory_order_acquire)) {
+        const auto connect_started = std::chrono::steady_clock::now();
         HANDLE candidate = open_pipe();
-        if (candidate == INVALID_HANDLE_VALUE) continue;
+        if (candidate == INVALID_HANDLE_VALUE) {
+          if (!logged_pipe_missing) {
+            logged_pipe_missing = true;
+            BOOST_LOG(info) << "Connection trace: DS4Windows bridge pipe not available yet; retrying"sv;
+          }
+          continue;
+        }
+        const auto handshake_started = std::chrono::steady_clock::now();
+        BOOST_LOG(info) << "Connection trace: DS4 bridge pipe opened; beginning handshake"sv;
         if (!handshake(candidate)) {
+          BOOST_LOG(warning) << "Connection trace: DS4 bridge handshake failed after "
+                             << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - handshake_started).count()
+                             << "ms";
           CloseHandle(candidate);
           continue;
         }
@@ -737,7 +806,10 @@ namespace platf {
           pipe = candidate;
           connected.store(true, std::memory_order_release);
         }
-        BOOST_LOG(info) << "DS4Windows controller bridge pipe handshake completed"sv;
+        BOOST_LOG(info) << "Connection trace: DS4Windows bridge handshake completed (connect_ms="
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - connect_started).count()
+                        << ')';
         outgoing_cv.notify_one();
         resend_active_slots();
 
@@ -750,6 +822,7 @@ namespace platf {
         // A broken/blocked peer must not leave the write worker holding the
         // pipe lock forever while the reader tries to reconnect.
         connected.store(false, std::memory_order_release);
+        BOOST_LOG(warning) << "Connection trace: DS4Windows bridge reader lost its pipe peer"sv;
         if (writer.joinable()) {
           CancelIoEx(candidate, nullptr);
         }
@@ -771,9 +844,7 @@ namespace platf {
     std::atomic<bool> stopping {};
     std::atomic<bool> connected {};
     std::atomic<bool> logged_unavailable_send {};
-    std::atomic<bool> logged_failed_send {};
     std::atomic<bool> logged_queue_full {};
-    std::atomic<bool> logged_slow_write {};
     std::atomic<bool> logged_first_gamepad_state {};
     std::atomic<bool> logged_non_neutral_gamepad_state {};
     std::atomic<std::uint32_t> logged_state_reports {};
@@ -1280,7 +1351,10 @@ namespace platf {
 
     // The app-to-app pipe is only needed when its explicit config option is enabled.
     if (config::input.ds4windows_bridge) {
+      BOOST_LOG(info) << "Connection trace: DS4Windows bridge is enabled by host input configuration"sv;
       raw.sunshine = new sunshine_controller_bridge_t {};
+    } else {
+      BOOST_LOG(info) << "Connection trace: DS4Windows bridge is disabled by host input configuration"sv;
     }
 
     raw.vigem = new vigem_t {};
